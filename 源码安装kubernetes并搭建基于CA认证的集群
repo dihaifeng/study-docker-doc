@@ -1,0 +1,103 @@
+搭建一个kubernetes集群对于新手来说比较困惑，感觉很难入手，虽然kubernetes官方提供了minikube来快速搭建一个单机版的集群。希望这篇文章对你有所帮助，本文描述了kubernetes的编译和多节点集群的搭建步骤基于ubuntu14.04 x86系统，为了方便，kubernetes的各个组件是运行在docker容器中的。
+搭建集群需要提前安装好docker, etcd, Go(编译使用)
+1、 安装docker的步骤略过，网上资料很多。
+2、安装Go的步骤也略过吧：）
+3、遍译kubernetes:
+从github上clone源码到你的GOPATH目录下的src/k8s.io（需要提前创建）目录下，
+
+git clone https://github.com/kubernetes/kubernetes.git
+
+然后cd到kubernetes目录下，首先下载编译需要的第三方包（注意这里会有坑，你懂的，如果下载不下来，那就自行百度吧，我是不是该把那些包也贴出来， 哈哈。。。），然后直接make编译就好。
+
+cd kubernetes
+go get ./...
+make build
+大约5分钟编译完成，这时ls一下会发现多了一个_output目录，对，我们要的就是它，这些个二进制文件。进入_output/bin目录，找到hyperkube 这个二进制文件（这个二进制文件包含了kubernetes各个组件的可执行文件，有它就足够了），完成。
+我们找到了二进制文件，可是如何让它们在容器中运行呢？不用担心，kubernetes已经提供编译hyperkube镜像的文件，还有etcd的，下面会讲到。
+编译hyperkube镜像：
+在kubernetes目录下有个cluster文件夹，然后你会发现它下面还有个images，对，你猜对了，就在这里：
+
+cluster/images/hyperkube
+make build VERSION=xxx ARCH=amd64
+编译完成后，你会发现你的docker images 里有了hyperkube镜像。
+同理，编译etcd：
+
+cd cluster/images/etcd
+make build ARCH=amd64
+4）到此，所需的组件已经准备好，我们开始搭建多节点的集群，多节点跨主机，主要需要注意网络那一块，kubernetes的集群是扁平管理的，就是说在不同节点上的容器可以相互ping通。我用的是flannel，关于flannel的安装和使用，请参考后续章节。
+下面贴出主要的组件配置，仅供参考。hostIP 表示master所在主机的IP，xxx:xx表示你编译好的hyperkube镜像，
+首先启动etcd
+
+docker run -d -p 4001:4001 -v /var/etcd/data:/var/etcd/data -name etcd xxx:xx etcd \
+-name etcd0 -data-dir /var/etcd/data -advertise-client-urls hostIP:4001 -listen-client-urls http://0.0.0.0:4001 -initial-advertise-peer-urls hostIP:2380 -listen-peer-urls http://0.0.0.0:2380 -initial-cluster-token etcd-cluster-1 -initial-cluster etcd0=hostIP:2380 -initial-cluster-state new
+master节点：
+
+docker run -d -p 8443:8443 -v /etc/kubernetes:/etc/kubernetes (CA证书目录) -name apiserver xxx:xx /hyperkube apiserver --bind-address=0.0.0.0
+--insecure-bind-address=127.0.0.1
+--etcd-servers=hostIP:4001
+--allow-privileged=true
+--service-cluster-ip-range=10.10.10.0/24
+--secure-port=8443
+--insecure-port=8080
+--advertise-address=hostIP
+--tls-cert-file=/etc/kubernetes/cert/apiserver.pem
+--tls-private-key-file=/etc/kubernetes/cert/apiserver-key.pem
+--client-ca-file=/etc/kubernetes/cert/ca.pem
+--admission-control=LimitRanger,NamespaceLifecycle,ServiceAccount,ResourceQuota
+--v=2
+
+docker run -d -v /etc/kubernetes:/etc/kubernetes -name controller-manager xxx:xx /hyperkube controller-manager --kubeconfig=/etc/kubernetes/controller-manager-kubeconfig
+--service-account-private-key-file=/etc/kubernetes/cert/apiserver-key.pem
+--root-ca-file=/etc/kubernetes/cert/ca.pem
+--v=2
+
+docker run -d  -v /etc/kubernetes:/etc/kubernetes -name scheduler xxx:xx /hyperkube scheduler 
+--kubeconfig=/etc/kubernetes/scheduler-kubeconfig
+--master=hostIP:443
+--cluster-dns=10.10.10.10
+--cluster-domain=cluster.local
+--v=6
+minion节点：
+
+docker run -d -v /etc/kubernetes:/etc/kubernetes -name kubelet xxx:xx /hyperkube kubelet 
+--api-servers=hostIP:443
+--allow-privileged=true 
+--cluster-dns=10.10.10.10
+--cluster-domain=cluster.local
+--config=/etc/kubernetes/manifests
+--kubeconfig=/etc/kubernetes/kubelet-kubeconfig
+--v=2
+--file-check-frequency=5s
+--hostname-override=所在主机IP
+--pod-infra-container-image=就是google的pause镜像
+--tls-cert-file=/etc/kubernetes/cert/kubelet.pem
+--tls-private-key-file=/etc/kubernetes/cert/kubelet-key.pem
+--logtostderr=false
+--log_dir=/var/log/kubernetes
+
+docker run -d -v /etc/kubernetes:/etc/kubernetes -name kube-proxy xxx:xx /hyperkube proxy --master=hostIP:443
+--kubeconfig=/etc/kubernetes/kubelet-kubeconfig
+--proxy-mode=userspace
+这里还需要一个kube-dns插件，在早期的kubernetes版本中是提供了启动DNS的yaml文件的（等找到后再贴出来吧），直接使用kubectl create -f xxx.yaml命令就可以启动。
+关于kubelet-kubeconfig 、scheduler-kubeconfig 、controller-manager-kubeconfig 是service account, 其中kubelet-kubeconfig配置如下：
+
+current-context: service-account-context
+apiVersion: v1
+kind: Config
+contexts:
+- context:
+    cluster: local
+    user: kubelet
+    namespace: default
+  name: service-account-context
+clusters:
+- name: local
+  cluster:
+    certificate-authority: /etc/kubernetes/cert/ca.pem
+    apiVersion: v1
+    server: hostIP:443
+users:
+- name: kubelet
+  user:
+    client-certificate: /etc/kubernetes/cert/kubelet.pem
+    client-key: /etc/kubernetes/cert/kubelet-key.pem
